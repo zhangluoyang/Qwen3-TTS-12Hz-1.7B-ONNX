@@ -1,0 +1,66 @@
+# Python caches / local env
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Editor / local agent state
+.vscode/
+.idea/
+.agents/
+
+# CMake / C++ build outputs
+build/
+cmake-build-*/
+cpp/build/
+cpp/build-*/
+compile_commands.json
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Vendored/generated third-party binaries and caches
+cpp/third_party/
+
+# Exported ONNX model directories
+onnx_isolated*/
+*.onnx
+*.onnx.data
+
+# Runtime comparison/debug outputs
+compare_outputs/
+dump*/
+trace*/
+chunk_outputs/
+*.timing.json
+*.detail.json
+
+# Generated audio outputs
+output*.wav
+*_output.wav
+*.mp3
+*.m4a
+*.flac
+
+# Large numpy/debug tensors
+*.npy
+*.npz
+
+# Local logs / temp files
+*.log
+*.tmp
+*.bak
+*.backup
+
+# Keep source docs/assets, but avoid accidentally committing local model data.
+data/*
+!data/.gitkeep
+!data/ref_from_mp3_24k_mono.wav
