@@ -199,4 +199,4 @@ cmake --build cpp/build -j2
 --chunk-dir           单独保存每个 chunk wav
 ```
 
-更多实现细节见 [cpp/README.md](cpp/README.md) 和 [qwen3-tts-onnx-runtime-zhihu-v2.md](qwen3-tts-onnx-runtime-zhihu-v2.md)。
+更多实现细节见 [cpp/README.md](cpp/README.md) 和 [知乎文章](https://zhuanlan.zhihu.com/p/2040565149275252714)。
