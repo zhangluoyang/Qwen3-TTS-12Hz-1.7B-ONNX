@@ -33,6 +33,28 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--dtype", choices=("float32", "float16"), default="float32")
     parser.add_argument("--clean", action="store_true", help="Delete output-root before exporting")
+    parser.add_argument(
+        "--skip-speaker-encoder",
+        action="store_true",
+        help="Skip speaker_encoder.onnx export. CustomVoice/VoiceDesign models do not use the Base voice-clone speaker encoder.",
+    )
+    parser.add_argument(
+        "--with-chunk-decoder",
+        action="store_true",
+        help="Also export tokenizer12hz_decode_chunk.onnx for chunk/pipeline runtime.",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=50,
+        help="Codec frame count used when tracing tokenizer12hz_decode_chunk.onnx.",
+    )
+    parser.add_argument(
+        "--left-context-size",
+        type=int,
+        default=25,
+        help="Left-context codec frame count used when tracing tokenizer12hz_decode_chunk.onnx.",
+    )
     args = parser.parse_args()
 
     root = Path(args.output_root)
@@ -57,6 +79,23 @@ def main() -> None:
             *(["--verify"] if args.dtype == "float32" else []),
         ],
     )
+
+    if args.with_chunk_decoder:
+        run_step(
+            "tokenizer12hz_chunk_decoder",
+            [
+                py,
+                str(script_dir / "export_tokenizer12hz_onnx.py"),
+                *common,
+                "--output-dir",
+                str(root / "tokenizer12hz"),
+                "--only-chunk-decoder",
+                "--chunk-size",
+                str(args.chunk_size),
+                "--left-context-size",
+                str(args.left_context_size),
+            ],
+        )
 
     run_step(
         "text_project",
@@ -144,17 +183,18 @@ def main() -> None:
         ],
     )
 
-    run_step(
-        "speaker_encoder",
-        [
-            py,
-            str(script_dir / "verify_speaker_encoder_onnx.py"),
-            *common,
-            "--output-dir",
-            str(root / "speaker_encoder"),
-            *verify_args,
-        ],
-    )
+    if not args.skip_speaker_encoder:
+        run_step(
+            "speaker_encoder",
+            [
+                py,
+                str(script_dir / "verify_speaker_encoder_onnx.py"),
+                *common,
+                "--output-dir",
+                str(root / "speaker_encoder"),
+                *verify_args,
+            ],
+        )
 
     print("\nAll isolated ONNX exports and verifications completed.", flush=True)
     print(f"DType: {args.dtype}", flush=True)
