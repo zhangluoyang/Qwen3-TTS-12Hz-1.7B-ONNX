@@ -34,6 +34,7 @@ void Usage(const char* argv0) {
             << " [--model DIR] [--onnx-root DIR]"
             << " [--provider CPUExecutionProvider|CUDAExecutionProvider]"
             << " [--prep-provider CPUExecutionProvider|CUDAExecutionProvider]"
+            << " [--decode-provider CPUExecutionProvider|CUDAExecutionProvider]"
             << " [--language auto] [--max-new-tokens N] [--chunk-frames N]"
             << " [--left-context-frames N] [--crossfade-ms N] [--seed N] [--cuda-device N]"
             << " [--greedy] [--async-chunk-decode] [--decode-workers N] [--max-decode-queue N]"
@@ -130,7 +131,7 @@ int main(int argc, char** argv) {
 
   qwen::onnx::VoiceCloneRequest request;
   request.text = "你好，这是 C++ chunk 流水线声音克隆测试。";
-  request.reference_audio = "./data/林志玲.mp3";
+  request.reference_audio = "./data/ref_from_mp3_24k_mono.wav";
   request.reference_text = "告诉自己，不要怕";
   request.max_new_tokens = 160;
 
@@ -152,6 +153,7 @@ int main(int argc, char** argv) {
     else if (arg == "--onnx-root") options.onnx_root = next();
     else if (arg == "--provider") options.providers = {next()};
     else if (arg == "--prep-provider") options.prep_providers = {next()};
+    else if (arg == "--decode-provider") options.decode_providers = {next()};
     else if (arg == "--text") request.text = next();
     else if (arg == "--ref-audio") request.reference_audio = next();
     else if (arg == "--ref-text") request.reference_text = next();
@@ -199,6 +201,7 @@ int main(int argc, char** argv) {
     if (!options.providers.empty() || !options.prep_providers.empty()) {
       std::cerr << "Using run provider=" << (options.providers.empty() ? "<none>" : options.providers[0])
                 << ", prep provider=" << (options.prep_providers.empty() ? "<none>" : options.prep_providers[0])
+                << ", decode provider=" << (options.decode_providers.empty() ? "<run>" : options.decode_providers[0])
                 << ", cuda_device_id=" << options.cuda_device_id << "\n";
     }
 

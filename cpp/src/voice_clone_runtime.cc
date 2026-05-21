@@ -93,6 +93,10 @@ bool UsesPrepProviders(const std::string& session_name) {
 
 const std::vector<std::string>& ProvidersForSession(const RuntimeOptions& options,
                                                     const std::string& session_name) {
+  if ((session_name == "tokenizer_decode" || session_name == "tokenizer_decode_chunk") &&
+      !options.decode_providers.empty()) {
+    return options.decode_providers;
+  }
   return UsesPrepProviders(session_name) ? options.prep_providers : options.providers;
 }
 
@@ -567,8 +571,10 @@ VoiceCloneRuntime::VoiceCloneRuntime(RuntimeOptions options)
   text_project_ = load_session("text_project", options_.onnx_root / "text_project" / "text_project.onnx");
   codec_embed_ = load_session("codec_embed", options_.onnx_root / "codec_embed" / "codec_embed.onnx");
   code_predictor_embed_ = load_session("code_predictor_embed", options_.onnx_root / "code_predictor_embed" / "code_predictor_embed.onnx");
-  speaker_encoder_ = load_session("speaker_encoder", options_.onnx_root / "speaker_encoder" / "speaker_encoder.onnx");
-  tokenizer_encode_ = load_session("tokenizer_encode", options_.onnx_root / "tokenizer12hz" / "tokenizer12hz_encode.onnx");
+  if (options_.load_reference_frontend) {
+    speaker_encoder_ = load_session("speaker_encoder", options_.onnx_root / "speaker_encoder" / "speaker_encoder.onnx");
+    tokenizer_encode_ = load_session("tokenizer_encode", options_.onnx_root / "tokenizer12hz" / "tokenizer12hz_encode.onnx");
+  }
   tokenizer_decode_ = load_session("tokenizer_decode", options_.onnx_root / "tokenizer12hz" / "tokenizer12hz_decode.onnx");
   code_predictor_ = load_session("code_predictor", options_.onnx_root / "code_predictor" / "code_predictor.onnx");
   talker_prefill_ = load_session("talker_prefill", options_.onnx_root / "talker_prefill" / "talker_prefill.onnx");
@@ -757,6 +763,9 @@ FloatTensor VoiceCloneRuntime::DecodeCodesChunk(const Int64Tensor& full_codes,
 }
 
 Int64Tensor VoiceCloneRuntime::EncodeReferenceCodes(const FloatTensor& audio) const {
+  if (tokenizer_encode_.ModelPath().empty()) {
+    throw std::runtime_error("Reference tokenizer encoder is not loaded; set RuntimeOptions::load_reference_frontend=true");
+  }
   // tokenizer12hz_encode.onnx: 24k waveform -> [T,16] RVQ codec codes。
   std::unordered_map<std::string, Ort::Value> inputs;
   inputs.emplace("audio", tokenizer_encode_.MakeTensor(audio, "audio"));
@@ -772,6 +781,9 @@ Int64Tensor VoiceCloneRuntime::EncodeReferenceCodes(const FloatTensor& audio) co
 }
 
 FloatTensor VoiceCloneRuntime::ExtractSpeakerEmbedding(const FloatTensor& mel) const {
+  if (speaker_encoder_.ModelPath().empty()) {
+    throw std::runtime_error("Speaker encoder is not loaded; set RuntimeOptions::load_reference_frontend=true");
+  }
   // speaker_encoder.onnx 输出 reshape 成 [1,1,hidden]，便于直接拼进 codec prompt。
   std::unordered_map<std::string, Ort::Value> inputs;
   inputs.emplace("mel", speaker_encoder_.MakeTensor(mel, "mel"));
@@ -842,6 +854,32 @@ std::vector<int64_t> VoiceCloneRuntime::LanguagePrefillIds(const std::string& la
   auto it = config_.talker.codec_language_id.find(lang);
   if (it == config_.talker.codec_language_id.end()) throw std::runtime_error("Unsupported language: " + language);
   return {config_.talker.codec_think_id, config_.talker.codec_think_bos_id, it->second, config_.talker.codec_think_eos_id};
+}
+
+std::vector<int64_t> VoiceCloneRuntime::CustomVoiceLanguagePrefillIds(const std::string& language,
+                                                                      const std::string& speaker) const {
+  std::string lang = language.empty() ? "auto" : language;
+  std::transform(lang.begin(), lang.end(), lang.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  std::string spk = speaker;
+  std::transform(spk.begin(), spk.end(), spk.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  const auto dialect = config_.talker.spk_is_dialect.find(spk);
+  if ((lang == "chinese" || lang == "auto") && dialect != config_.talker.spk_is_dialect.end()) {
+    lang = dialect->second;
+  }
+  return LanguagePrefillIds(lang);
+}
+
+FloatTensor VoiceCloneRuntime::CustomVoiceSpeakerEmbedding(const std::string& speaker) const {
+  std::string spk = speaker;
+  std::transform(spk.begin(), spk.end(), spk.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  auto it = config_.talker.spk_id.find(spk);
+  if (it == config_.talker.spk_id.end()) {
+    std::ostringstream ss;
+    ss << "Unsupported CustomVoice speaker: " << speaker << ". Supported:";
+    for (const auto& [name, _] : config_.talker.spk_id) ss << " " << name;
+    throw std::runtime_error(ss.str());
+  }
+  return CodecEmbed(RowTensor({it->second}));
 }
 
 FloatTensor VoiceCloneRuntime::ReferenceCodeEmbedding(const Int64Tensor& ref_codes) const {
@@ -926,6 +964,109 @@ FloatTensor VoiceCloneRuntime::BuildTalkerPrompt(const VoiceCloneInputs& inputs,
   return out;
 }
 
+FloatTensor VoiceCloneRuntime::BuildCustomVoicePrompt(const CustomVoiceRequest& request,
+                                                      FloatTensor* trailing_text,
+                                                      FloatTensor* tts_pad) const {
+  const auto timing_start = Clock::now();
+  const auto input_ids = EncodeAssistantText(request.text);
+  if (input_ids.size() < 8) throw std::invalid_argument("custom voice text ids are too short");
+
+  auto special = TextProject(RowTensor({config_.tts_bos_token_id, config_.tts_eos_token_id, config_.tts_pad_token_id}));
+  auto tts_bos = SliceAxis1(special, 0, 1);
+  auto tts_eos = SliceAxis1(special, 1, 2);
+  *tts_pad = SliceAxis1(special, 2, 3);
+
+  auto codec_prefill = CodecEmbed(RowTensor(CustomVoiceLanguagePrefillIds(request.language, request.speaker)));
+  auto speaker_embed = CustomVoiceSpeakerEmbedding(request.speaker);
+  auto codec_tail = CodecEmbed(RowTensor({config_.talker.codec_pad_id, config_.talker.codec_bos_id}));
+  auto codec_input = ConcatAxis1({codec_prefill, speaker_embed, codec_tail});
+
+  auto role = TextProject(Int64Tensor({1, 3}, {input_ids[0], input_ids[1], input_ids[2]}));
+  auto left_pad = RepeatAxis1(*tts_pad, codec_input.shape()[1] - 2);
+  auto codec_part = Add(ConcatAxis1({left_pad, tts_bos}), SliceAxis1(codec_input, 0, codec_input.shape()[1] - 1));
+  auto talker_input = ConcatAxis1({role, codec_part});
+
+  auto first_text = Add(TextProject(RowTensor({input_ids[3]})),
+                        SliceAxis1(codec_input, codec_input.shape()[1] - 1, codec_input.shape()[1]));
+  talker_input = ConcatAxis1({talker_input, first_text});
+
+  if (request.non_streaming_mode) {
+    std::vector<int64_t> body_ids(input_ids.begin() + 3, input_ids.end() - 5);
+    auto text_with_eos = ConcatAxis1({TextProject(RowTensor(body_ids)), tts_eos});
+    auto codec_pad = CodecEmbed(RowTensor(std::vector<int64_t>(static_cast<size_t>(text_with_eos.shape()[1]),
+                                                               config_.talker.codec_pad_id)));
+    auto codec_bos = CodecEmbed(RowTensor({config_.talker.codec_bos_id}));
+    *trailing_text = *tts_pad;
+    auto out = ConcatAxis1({
+        SliceAxis1(talker_input, 0, talker_input.shape()[1] - 1),
+        Add(text_with_eos, codec_pad),
+        Add(*tts_pad, codec_bos),
+    });
+    AddTiming("prep.build_custom_voice_prompt", ElapsedMs(timing_start));
+    return out;
+  }
+
+  std::vector<int64_t> trailing_ids(input_ids.begin() + 4, input_ids.end() - 5);
+  *trailing_text = ConcatAxis1({TextProject(RowTensor(trailing_ids)), tts_eos});
+  AddTiming("prep.build_custom_voice_prompt", ElapsedMs(timing_start));
+  return talker_input;
+}
+
+FloatTensor VoiceCloneRuntime::BuildVoiceDesignPrompt(const VoiceDesignRequest& request,
+                                                      FloatTensor* trailing_text,
+                                                      FloatTensor* tts_pad) const {
+  const auto timing_start = Clock::now();
+  const auto input_ids = EncodeAssistantText(request.text);
+  if (input_ids.size() < 8) throw std::invalid_argument("voice design text ids are too short");
+
+  auto special = TextProject(RowTensor({config_.tts_bos_token_id, config_.tts_eos_token_id, config_.tts_pad_token_id}));
+  auto tts_bos = SliceAxis1(special, 0, 1);
+  auto tts_eos = SliceAxis1(special, 1, 2);
+  *tts_pad = SliceAxis1(special, 2, 3);
+
+  FloatTensor instruct_prefix;
+  if (!request.instruct.empty()) {
+    const auto instruct_ids = tokenizer_->Encode("<|im_start|>user\n" + request.instruct + "<|im_end|>\n");
+    instruct_prefix = TextProject(RowTensor(instruct_ids));
+  }
+
+  auto codec_prefill = CodecEmbed(RowTensor(LanguagePrefillIds(request.language)));
+  auto codec_tail = CodecEmbed(RowTensor({config_.talker.codec_pad_id, config_.talker.codec_bos_id}));
+  auto codec_input = ConcatAxis1({codec_prefill, codec_tail});
+
+  auto role = TextProject(Int64Tensor({1, 3}, {input_ids[0], input_ids[1], input_ids[2]}));
+  auto left_pad = RepeatAxis1(*tts_pad, codec_input.shape()[1] - 2);
+  auto codec_part = Add(ConcatAxis1({left_pad, tts_bos}), SliceAxis1(codec_input, 0, codec_input.shape()[1] - 1));
+  auto talker_input = ConcatAxis1({role, codec_part});
+
+  auto first_text = Add(TextProject(RowTensor({input_ids[3]})),
+                        SliceAxis1(codec_input, codec_input.shape()[1] - 1, codec_input.shape()[1]));
+  talker_input = ConcatAxis1({talker_input, first_text});
+
+  if (request.non_streaming_mode) {
+    std::vector<int64_t> body_ids(input_ids.begin() + 3, input_ids.end() - 5);
+    auto text_with_eos = ConcatAxis1({TextProject(RowTensor(body_ids)), tts_eos});
+    auto codec_pad = CodecEmbed(RowTensor(std::vector<int64_t>(static_cast<size_t>(text_with_eos.shape()[1]),
+                                                               config_.talker.codec_pad_id)));
+    auto codec_bos = CodecEmbed(RowTensor({config_.talker.codec_bos_id}));
+    *trailing_text = *tts_pad;
+    auto out = ConcatAxis1({
+        SliceAxis1(talker_input, 0, talker_input.shape()[1] - 1),
+        Add(text_with_eos, codec_pad),
+        Add(*tts_pad, codec_bos),
+    });
+    if (!instruct_prefix.empty()) out = ConcatAxis1({instruct_prefix, out});
+    AddTiming("prep.build_voice_design_prompt", ElapsedMs(timing_start));
+    return out;
+  }
+
+  std::vector<int64_t> trailing_ids(input_ids.begin() + 4, input_ids.end() - 5);
+  *trailing_text = ConcatAxis1({TextProject(RowTensor(trailing_ids)), tts_eos});
+  if (!instruct_prefix.empty()) talker_input = ConcatAxis1({instruct_prefix, talker_input});
+  AddTiming("prep.build_voice_design_prompt", ElapsedMs(timing_start));
+  return talker_input;
+}
+
 std::pair<std::vector<int64_t>, FloatTensor> VoiceCloneRuntime::RunCodePredictor(const FloatTensor& past_hidden,
                                                                                   int64_t first_token,
                                                                                   const SamplingOptions& options,
@@ -1004,13 +1145,31 @@ std::pair<std::vector<int64_t>, FloatTensor> VoiceCloneRuntime::RunCodePredictor
 }
 
 VoiceCloneResult VoiceCloneRuntime::GenerateFromPrepared(const VoiceCloneInputs& inputs) {
-  const auto total_start = Clock::now();
-  const bool trace_tokens = std::getenv("QWEN_TRACE_TOKENS") != nullptr;
   FloatTensor trailing_text;
   FloatTensor tts_pad;
   // prompt 是 prefill 阶段一次性喂给 talker 的上下文；
   // trailing_text 是生成循环中逐帧追加的目标文本 embedding。
   auto prompt = BuildTalkerPrompt(inputs, &trailing_text, &tts_pad);
+  return GenerateFromPrompt(prompt,
+                            trailing_text,
+                            tts_pad,
+                            inputs.reference_codes,
+                            inputs.max_new_tokens,
+                            inputs.main_sampling,
+                            inputs.code_sampling,
+                            inputs.debug_dump_dir);
+}
+
+VoiceCloneResult VoiceCloneRuntime::GenerateFromPrompt(const FloatTensor& prompt,
+                                                       const FloatTensor& trailing_text,
+                                                       const FloatTensor& tts_pad,
+                                                       const Int64Tensor& reference_codes,
+                                                       int max_new_tokens,
+                                                       const SamplingOptions& main_sampling,
+                                                       const SamplingOptions& code_sampling,
+                                                       const std::filesystem::path& debug_dump_dir) {
+  const auto total_start = Clock::now();
+  const bool trace_tokens = std::getenv("QWEN_TRACE_TOKENS") != nullptr;
 
   auto attention_mask = Int64Tensor({1, prompt.shape()[1]}, std::vector<int64_t>(static_cast<size_t>(prompt.shape()[1]), 1));
   std::unordered_map<std::string, Ort::Value> prefill_kv_inputs;
@@ -1035,28 +1194,28 @@ VoiceCloneResult VoiceCloneRuntime::GenerateFromPrepared(const VoiceCloneInputs&
   AddTiming("onnx.talker_prefill", ElapsedMs(prefill_start));
   std::vector<float> next_logits = LastLogits(prefill_outputs[0]);
   auto last_hidden = LastHidden(prefill_outputs[1]);
-  if (!inputs.debug_dump_dir.empty()) {
-    WriteNpy(inputs.debug_dump_dir / "prompt.npy", prompt.values(), prompt.shape());
-    WriteNpy(inputs.debug_dump_dir / "prefill_logits_last.npy", next_logits, {config_.talker.vocab_size});
+  if (!debug_dump_dir.empty()) {
+    WriteNpy(debug_dump_dir / "prompt.npy", prompt.values(), prompt.shape());
+    WriteNpy(debug_dump_dir / "prefill_logits_last.npy", next_logits, {config_.talker.vocab_size});
     auto last_hidden_full = CopyFloatTensor(prefill_outputs[1]);
-    WriteNpy(inputs.debug_dump_dir / "prefill_last_hidden_full.npy", last_hidden_full.values(), last_hidden_full.shape());
+    WriteNpy(debug_dump_dir / "prefill_last_hidden_full.npy", last_hidden_full.values(), last_hidden_full.shape());
   }
   std::vector<Ort::Value> past;
   past.reserve(static_cast<size_t>(config_.talker.num_hidden_layers * 2));
   for (size_t i = 2; i < prefill_outputs.size(); ++i) {
     past.emplace_back(std::move(prefill_outputs[i]));
   }
-  if (!inputs.debug_dump_dir.empty() && !past.empty()) {
+  if (!debug_dump_dir.empty() && !past.empty()) {
     auto k0 = CopyFloatTensor(past[0]);
     auto v0 = CopyFloatTensor(past[1]);
-    WriteNpy(inputs.debug_dump_dir / "prefill_past_key_0.npy", k0.values(), k0.shape());
-    WriteNpy(inputs.debug_dump_dir / "prefill_past_value_0.npy", v0.values(), v0.shape());
+    WriteNpy(debug_dump_dir / "prefill_past_key_0.npy", k0.values(), k0.shape());
+    WriteNpy(debug_dump_dir / "prefill_past_value_0.npy", v0.values(), v0.shape());
   }
 
   std::vector<int64_t> first_tokens;
   std::vector<int64_t> generated_flat;
   int64_t past_len = prompt.shape()[1];
-  const int max_frames = std::max(inputs.max_new_tokens - 1, 1);
+  const int max_frames = std::max(max_new_tokens - 1, 1);
   std::vector<std::string> decode_output_names{"logits", "last_hidden"};
   decode_output_names.reserve(static_cast<size_t>(2 + config_.talker.num_hidden_layers * 2));
   std::unordered_set<std::string> decode_device_output_names{"logits", "last_hidden"};
@@ -1075,10 +1234,10 @@ VoiceCloneResult VoiceCloneRuntime::GenerateFromPrepared(const VoiceCloneInputs&
                                     std::vector<int64_t>(static_cast<size_t>(past_len + 2), 1));
   decode_attention_mask.values().reserve(static_cast<size_t>(prompt.shape()[1] + max_frames + 2));
   Int64Tensor decode_cache_position({1}, {past_len});
-  if (!inputs.debug_dump_dir.empty()) {
-    WriteNpy(inputs.debug_dump_dir / "sampling_flags.npy",
-             std::vector<int64_t>{inputs.main_sampling.do_sample ? 1 : 0,
-                                  inputs.code_sampling.do_sample ? 1 : 0},
+  if (!debug_dump_dir.empty()) {
+    WriteNpy(debug_dump_dir / "sampling_flags.npy",
+             std::vector<int64_t>{main_sampling.do_sample ? 1 : 0,
+                                  code_sampling.do_sample ? 1 : 0},
              {2});
   }
 
@@ -1096,10 +1255,10 @@ VoiceCloneResult VoiceCloneRuntime::GenerateFromPrepared(const VoiceCloneInputs&
     }
     AddTiming("generation.last_logits_filter", ElapsedMs(logits_filter_start));
     const auto sample_start = Clock::now();
-    int64_t first = sampler_.Sample(filtered_logits, inputs.main_sampling, first_tokens);
-    if (!inputs.debug_dump_dir.empty()) {
+    int64_t first = sampler_.Sample(filtered_logits, main_sampling, first_tokens);
+    if (!debug_dump_dir.empty()) {
       int64_t forced = 0;
-      const auto forced_path = inputs.debug_dump_dir / ("first_token_pick_f" + std::to_string(frame) + ".npy");
+      const auto forced_path = debug_dump_dir / ("first_token_pick_f" + std::to_string(frame) + ".npy");
       if (ReadNpyInt64Scalar(forced_path, &forced)) {
         first = forced;
       }
@@ -1114,10 +1273,10 @@ VoiceCloneResult VoiceCloneRuntime::GenerateFromPrepared(const VoiceCloneInputs&
                 << (first == config_.talker.codec_eos_token_id ? " hit_eos=1" : " hit_eos=0")
                 << "\n";
     }
-    if (!inputs.debug_dump_dir.empty()) {
-      WriteNpy(inputs.debug_dump_dir / ("first_token_logits_f" + std::to_string(frame) + ".npy"),
+    if (!debug_dump_dir.empty()) {
+      WriteNpy(debug_dump_dir / ("first_token_logits_f" + std::to_string(frame) + ".npy"),
                filtered_logits, {static_cast<int64_t>(filtered_logits.size())});
-      WriteNpy(inputs.debug_dump_dir / ("first_token_pick_f" + std::to_string(frame) + ".npy"),
+      WriteNpy(debug_dump_dir / ("first_token_pick_f" + std::to_string(frame) + ".npy"),
                std::vector<int64_t>{first}, {1});
     }
     if (first == config_.talker.codec_eos_token_id) {
@@ -1126,7 +1285,7 @@ VoiceCloneResult VoiceCloneRuntime::GenerateFromPrepared(const VoiceCloneInputs&
     }
     first_tokens.push_back(first);
     // talker 只给出每帧第 0 个 codebook token；剩余 15 个由 code_predictor 补齐。
-    auto [row, frame_embed] = RunCodePredictor(last_hidden, first, inputs.code_sampling, frame, inputs.debug_dump_dir);
+    auto [row, frame_embed] = RunCodePredictor(last_hidden, first, code_sampling, frame, debug_dump_dir);
     const auto append_codes_start = Clock::now();
     generated_flat.insert(generated_flat.end(), row.begin(), row.end());
     AddTiming("generation.append_generated_codes", ElapsedMs(append_codes_start));
@@ -1138,15 +1297,15 @@ VoiceCloneResult VoiceCloneRuntime::GenerateFromPrepared(const VoiceCloneInputs&
     // decode_embed 是“上一帧 codec embedding + 当前文本 embedding”。
     // 文本耗尽后用 tts_pad，让模型继续依靠 codec 自回归直到 EOS。
     AddTiming("generation.build_decode_embed", ElapsedMs(decode_embed_start));
-    if (!inputs.debug_dump_dir.empty() && frame == 0) {
-      WriteNpy(inputs.debug_dump_dir / "decode0_inputs_embeds.npy", decode_embed.values(), decode_embed.shape());
-      WriteNpy(inputs.debug_dump_dir / "decode0_attention_mask.npy",
+    if (!debug_dump_dir.empty() && frame == 0) {
+      WriteNpy(debug_dump_dir / "decode0_inputs_embeds.npy", decode_embed.values(), decode_embed.shape());
+      WriteNpy(debug_dump_dir / "decode0_attention_mask.npy",
                std::vector<int64_t>(static_cast<size_t>(past_len + 2), 1), {1, past_len + 2});
-      WriteNpy(inputs.debug_dump_dir / "decode0_cache_position.npy", std::vector<int64_t>{past_len}, {1});
+      WriteNpy(debug_dump_dir / "decode0_cache_position.npy", std::vector<int64_t>{past_len}, {1});
       auto k0 = CopyFloatTensor(past[0]);
       auto v0 = CopyFloatTensor(past[1]);
-      WriteNpy(inputs.debug_dump_dir / "decode0_past_key_0.npy", k0.values(), k0.shape());
-      WriteNpy(inputs.debug_dump_dir / "decode0_past_value_0.npy", v0.values(), v0.shape());
+      WriteNpy(debug_dump_dir / "decode0_past_key_0.npy", k0.values(), k0.shape());
+      WriteNpy(debug_dump_dir / "decode0_past_value_0.npy", v0.values(), v0.shape());
     }
     const auto feed_start = Clock::now();
     std::unordered_map<std::string, Ort::Value> feeds;
@@ -1171,10 +1330,10 @@ VoiceCloneResult VoiceCloneRuntime::GenerateFromPrepared(const VoiceCloneInputs&
     AddTiming("onnx.talker_decode", ElapsedMs(decode_start));
     next_logits = LastLogits(out[0]);
     last_hidden = LastHidden(out[1]);
-    if (!inputs.debug_dump_dir.empty() && frame == 0) {
-      WriteNpy(inputs.debug_dump_dir / "decode0_logits_last.npy", next_logits, {config_.talker.vocab_size});
+    if (!debug_dump_dir.empty() && frame == 0) {
+      WriteNpy(debug_dump_dir / "decode0_logits_last.npy", next_logits, {config_.talker.vocab_size});
       auto hidden_full = CopyFloatTensor(out[1]);
-      WriteNpy(inputs.debug_dump_dir / "decode0_last_hidden.npy", hidden_full.values(), hidden_full.shape());
+      WriteNpy(debug_dump_dir / "decode0_last_hidden.npy", hidden_full.values(), hidden_full.shape());
     }
     past.clear();
     past.reserve(static_cast<size_t>(config_.talker.num_hidden_layers * 2));
@@ -1196,13 +1355,13 @@ VoiceCloneResult VoiceCloneRuntime::GenerateFromPrepared(const VoiceCloneInputs&
     const auto post_start = Clock::now();
     Int64Tensor decode_codes = result.generated_codes;
     int64_t ref_frames = 0;
-    if (!inputs.reference_codes.empty()) {
+    if (!reference_codes.empty()) {
       // ICL 模式下完整 decoder 需要 reference + generated 一起解码，声音衔接更自然。
-      ref_frames = inputs.reference_codes.shape()[0];
+      ref_frames = reference_codes.shape()[0];
       decode_codes = Int64Tensor({ref_frames + result.generated_codes.shape()[0], config_.talker.num_code_groups});
-      std::copy(inputs.reference_codes.values().begin(), inputs.reference_codes.values().end(), decode_codes.values().begin());
+      std::copy(reference_codes.values().begin(), reference_codes.values().end(), decode_codes.values().begin());
       std::copy(result.generated_codes.values().begin(), result.generated_codes.values().end(),
-                decode_codes.values().begin() + static_cast<long>(inputs.reference_codes.size()));
+                decode_codes.values().begin() + static_cast<long>(reference_codes.size()));
     }
     AddTiming("post.prepare_vocoder_codes", ElapsedMs(post_start));
     const auto vocoder_start = Clock::now();
@@ -1561,6 +1720,49 @@ VoiceCloneResult VoiceCloneRuntime::GenerateVoiceClone(const VoiceCloneRequest& 
   inputs.code_sampling = request.code_sampling;
   auto result = GenerateFromPrepared(inputs);
   AddTiming("total.generate_voice_clone", ElapsedMs(total_start));
+  return result;
+}
+
+VoiceCloneResult VoiceCloneRuntime::GenerateCustomVoice(const CustomVoiceRequest& request) {
+  const auto total_start = Clock::now();
+  if (config_.tts_model_type != "custom_voice") {
+    throw std::runtime_error("GenerateCustomVoice requires a custom_voice model, got: " + config_.tts_model_type);
+  }
+  if (!request.instruct.empty()) {
+    AddTiming("prep.custom_voice_instruct_ignored", 0.0);
+  }
+  FloatTensor trailing_text;
+  FloatTensor tts_pad;
+  auto prompt = BuildCustomVoicePrompt(request, &trailing_text, &tts_pad);
+  auto result = GenerateFromPrompt(prompt,
+                                   trailing_text,
+                                   tts_pad,
+                                   Int64Tensor{},
+                                   request.max_new_tokens,
+                                   request.main_sampling,
+                                   request.code_sampling,
+                                   request.debug_dump_dir);
+  AddTiming("total.generate_custom_voice", ElapsedMs(total_start));
+  return result;
+}
+
+VoiceCloneResult VoiceCloneRuntime::GenerateVoiceDesign(const VoiceDesignRequest& request) {
+  const auto total_start = Clock::now();
+  if (config_.tts_model_type != "voice_design") {
+    throw std::runtime_error("GenerateVoiceDesign requires a voice_design model, got: " + config_.tts_model_type);
+  }
+  FloatTensor trailing_text;
+  FloatTensor tts_pad;
+  auto prompt = BuildVoiceDesignPrompt(request, &trailing_text, &tts_pad);
+  auto result = GenerateFromPrompt(prompt,
+                                   trailing_text,
+                                   tts_pad,
+                                   Int64Tensor{},
+                                   request.max_new_tokens,
+                                   request.main_sampling,
+                                   request.code_sampling,
+                                   request.debug_dump_dir);
+  AddTiming("total.generate_voice_design", ElapsedMs(total_start));
   return result;
 }
 

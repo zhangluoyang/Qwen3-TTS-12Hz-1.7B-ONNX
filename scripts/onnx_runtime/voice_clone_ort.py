@@ -246,7 +246,16 @@ class Qwen3TTSVoiceCloneORT:
     最后调用 tokenizer decoder 合成音频。
     """
 
-    def __init__(self, model_dir, onnx_root, providers=None, seed=1234, print_timing=True, use_iobinding=True):
+    def __init__(
+        self,
+        model_dir,
+        onnx_root,
+        providers=None,
+        seed=1234,
+        print_timing=True,
+        use_iobinding=True,
+        load_reference_frontend=True,
+    ):
         self.model_dir = Path(model_dir)
         self.onnx_root = Path(onnx_root)
         self.providers = providers or ["CPUExecutionProvider"]
@@ -288,8 +297,11 @@ class Qwen3TTSVoiceCloneORT:
             "code_predictor_embed",
             prep_iobinding,
         )
-        self.speaker_encoder = make_session(self.onnx_root / "speaker_encoder" / "speaker_encoder.onnx", self.prep_providers, self.timer, "speaker_encoder", prep_iobinding)
-        self.tokenizer_encode = make_session(self.onnx_root / "tokenizer12hz" / "tokenizer12hz_encode.onnx", self.prep_providers, self.timer, "tokenizer_encode", prep_iobinding)
+        self.speaker_encoder = None
+        self.tokenizer_encode = None
+        if load_reference_frontend:
+            self.speaker_encoder = make_session(self.onnx_root / "speaker_encoder" / "speaker_encoder.onnx", self.prep_providers, self.timer, "speaker_encoder", prep_iobinding)
+            self.tokenizer_encode = make_session(self.onnx_root / "tokenizer12hz" / "tokenizer12hz_encode.onnx", self.prep_providers, self.timer, "tokenizer_encode", prep_iobinding)
         self.tokenizer_decode = make_session(self.onnx_root / "tokenizer12hz" / "tokenizer12hz_decode.onnx", self.providers, self.timer, "tokenizer_decode", run_iobinding)
         # chunk decoder 是可选实验能力，默认非流式路径不加载它。
         self.tokenizer_decode_chunk = None
@@ -1233,7 +1245,7 @@ def main():
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--onnx-root", default=DEFAULT_ONNX_ROOT)
     parser.add_argument("--text", default="我和我的祖国，一刻也不能分割，无论你走到哪里")
-    parser.add_argument("--ref-audio", default="./data/林志玲.mp3")
+    parser.add_argument("--ref-audio", default="./data/ref_from_mp3_24k_mono.wav")
     parser.add_argument("--ref-text", default="告诉自己，不要怕")
     parser.add_argument("--language", default="auto")
     parser.add_argument("--output", default="output_voice_clone_ort.wav")

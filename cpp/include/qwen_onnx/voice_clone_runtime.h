@@ -38,11 +38,16 @@ struct RuntimeOptions {
   std::filesystem::path onnx_root;
   // Heavy generation/decoder sessions. Use CUDA by default.
   std::vector<std::string> providers{"CUDAExecutionProvider"};
+  // Optional tokenizer decoder provider override. Empty means use providers.
+  std::vector<std::string> decode_providers;
   // Lightweight preprocessing/embedding sessions. Keep on CPU by default for
   // batch=1 latency and lower GPU memory pressure.
   std::vector<std::string> prep_providers{"CPUExecutionProvider"};
   uint64_t seed = 1234;
   int cuda_device_id = 0;
+  // Base voice clone needs tokenizer_encode + speaker_encoder. CustomVoice does
+  // not have/use those ONNX files, so it can skip loading them.
+  bool load_reference_frontend = true;
 };
 
 struct VoiceCloneInputs {
@@ -120,6 +125,31 @@ struct VoiceCloneRequest {
   SamplingOptions code_sampling;
 };
 
+struct CustomVoiceRequest {
+  std::string text;
+  std::string speaker = "Vivian";
+  std::string language = "auto";
+  // 0.6B CustomVoice ignores instruct in the official wrapper; keep the field
+  // here so higher-level callers can share one API with larger variants later.
+  std::string instruct;
+  bool non_streaming_mode = true;
+  int max_new_tokens = 300;
+  SamplingOptions main_sampling;
+  SamplingOptions code_sampling;
+  std::filesystem::path debug_dump_dir;
+};
+
+struct VoiceDesignRequest {
+  std::string text;
+  std::string instruct = "一个年轻女性的声音，语气温柔自然，语速适中，发音清晰。";
+  std::string language = "auto";
+  bool non_streaming_mode = true;
+  int max_new_tokens = 300;
+  SamplingOptions main_sampling;
+  SamplingOptions code_sampling;
+  std::filesystem::path debug_dump_dir;
+};
+
 struct TimingRecord {
   std::string name;
   int64_t count = 0;
@@ -165,6 +195,8 @@ class VoiceCloneRuntime {
   // 文本 id、参考 codes、说话人 embedding 准备好之后的核心生成路径。
   VoiceCloneResult GenerateFromPrepared(const VoiceCloneInputs& inputs);
   VoiceCloneResult GenerateVoiceClone(const VoiceCloneRequest& request);
+  VoiceCloneResult GenerateCustomVoice(const CustomVoiceRequest& request);
+  VoiceCloneResult GenerateVoiceDesign(const VoiceDesignRequest& request);
   VoiceCloneChunkedResult GenerateFromPreparedChunked(const VoiceCloneInputs& inputs,
                                                       const VoiceCloneChunkOptions& chunk_options,
                                                       const VoiceCloneChunkCallback& on_chunk = {});
@@ -176,8 +208,20 @@ class VoiceCloneRuntime {
   OrtSession& ChunkDecoder();
   // 下面这些私有函数对应 pipeline 中间步骤，保持粒度小是为了方便逐步对齐。
   std::vector<int64_t> LanguagePrefillIds(const std::string& language) const;
+  std::vector<int64_t> CustomVoiceLanguagePrefillIds(const std::string& language, const std::string& speaker) const;
+  FloatTensor CustomVoiceSpeakerEmbedding(const std::string& speaker) const;
   FloatTensor ReferenceCodeEmbedding(const Int64Tensor& ref_codes) const;
   FloatTensor BuildTalkerPrompt(const VoiceCloneInputs& inputs, FloatTensor* trailing_text, FloatTensor* tts_pad) const;
+  FloatTensor BuildCustomVoicePrompt(const CustomVoiceRequest& request, FloatTensor* trailing_text, FloatTensor* tts_pad) const;
+  FloatTensor BuildVoiceDesignPrompt(const VoiceDesignRequest& request, FloatTensor* trailing_text, FloatTensor* tts_pad) const;
+  VoiceCloneResult GenerateFromPrompt(const FloatTensor& prompt,
+                                      const FloatTensor& trailing_text,
+                                      const FloatTensor& tts_pad,
+                                      const Int64Tensor& reference_codes,
+                                      int max_new_tokens,
+                                      const SamplingOptions& main_sampling,
+                                      const SamplingOptions& code_sampling,
+                                      const std::filesystem::path& debug_dump_dir);
   std::pair<std::vector<int64_t>, FloatTensor> RunCodePredictor(const FloatTensor& past_hidden,
                                                                  int64_t first_token,
                                                                  const SamplingOptions& options,

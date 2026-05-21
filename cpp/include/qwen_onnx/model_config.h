@@ -30,6 +30,10 @@ struct TalkerConfig {
   int64_t codec_think_bos_id = 2156;
   int64_t codec_think_eos_id = 2157;
   std::unordered_map<std::string, int64_t> codec_language_id;
+  // CustomVoice predefined speaker ids live in the talker codec embedding table.
+  std::unordered_map<std::string, int64_t> spk_id;
+  // Dialect speakers override Chinese/auto language control with a dialect id.
+  std::unordered_map<std::string, std::string> spk_is_dialect;
 };
 
 struct ModelConfig {

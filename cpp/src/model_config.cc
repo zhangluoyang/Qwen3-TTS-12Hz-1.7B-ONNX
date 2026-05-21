@@ -91,6 +91,21 @@ std::unordered_map<std::string, int64_t> FindIntMap(const std::string& text, con
   return out;
 }
 
+std::unordered_map<std::string, std::string> FindStringMap(const std::string& text, const std::string& key) {
+  std::unordered_map<std::string, std::string> out;
+  const auto pos = text.find("\"" + key + "\"");
+  if (pos == std::string::npos) return out;
+  const auto begin = text.find('{', pos);
+  const auto end = text.find('}', begin);
+  if (begin == std::string::npos || end == std::string::npos) return out;
+  const std::string body = text.substr(begin + 1, end - begin - 1);
+  std::regex item("\\\"([^\\\"]+)\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"");
+  for (auto it = std::sregex_iterator(body.begin(), body.end(), item); it != std::sregex_iterator(); ++it) {
+    out[(*it)[1].str()] = (*it)[2].str();
+  }
+  return out;
+}
+
 }  // 匿名命名空间
 
 ModelConfig LoadModelConfig(const std::filesystem::path& model_dir) {
@@ -120,6 +135,8 @@ ModelConfig LoadModelConfig(const std::filesystem::path& model_dir) {
   t.codec_think_bos_id = FindInt(talker_text, "codec_think_bos_id", t.codec_think_bos_id);
   t.codec_think_eos_id = FindInt(talker_text, "codec_think_eos_id", t.codec_think_eos_id);
   t.codec_language_id = FindIntMap(talker_text, "codec_language_id");
+  t.spk_id = FindIntMap(talker_text, "spk_id");
+  t.spk_is_dialect = FindStringMap(talker_text, "spk_is_dialect");
   return cfg;
 }
 
