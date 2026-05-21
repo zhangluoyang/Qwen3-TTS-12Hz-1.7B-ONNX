@@ -12,8 +12,8 @@ import torch
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 
 
-MODEL_DIR = Path("/home/zhang/.cache/modelscope/hub/models/Qwen/Qwen3-TTS-12Hz-0.6B-Base")
-REFERENCE_AUDIO = Path("data/林志玲.mp3")
+MODEL_DIR = Path("/home/zhang/.cache/modelscope/hub/models/Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+REFERENCE_AUDIO = Path("data/ref_from_mp3_24k_mono.wav")
 OUTPUT_WAV = Path("output_pytorch_voice_clone_example.wav")
 
 

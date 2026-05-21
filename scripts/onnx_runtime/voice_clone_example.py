@@ -12,9 +12,9 @@ import soundfile as sf
 from voice_clone_ort import Qwen3TTSVoiceCloneORT
 
 
-MODEL_DIR = Path("/home/zhang/.cache/modelscope/hub/models/Qwen/Qwen3-TTS-12Hz-0.6B-Base")
-ONNX_ROOT = Path("onnx_isolated_0p6b_fp32")
-REFERENCE_AUDIO = Path("data/林志玲.mp3")
+MODEL_DIR = Path("/home/zhang/.cache/modelscope/hub/models/Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+ONNX_ROOT = Path("onnx_isolated_fp16")
+REFERENCE_AUDIO = Path("data/ref_from_mp3_24k_mono.wav")
 OUTPUT_WAV = Path("output_python_voice_clone_fp16_example.wav")
 
 

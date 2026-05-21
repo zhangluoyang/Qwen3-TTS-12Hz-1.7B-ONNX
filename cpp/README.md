@@ -32,6 +32,8 @@ cpp/
     wav_writer.cc
   apps/
     qwen_ort_smoke.cc
+    qwen_custom_voice.cc
+    qwen_voice_design.cc
     qwen_voice_clone.cc
     qwen_voice_clone_chunk.cc
     qwen_voice_clone_skeleton.cc
@@ -71,7 +73,14 @@ python scripts/onnx_export/export_all_isolated_onnx.py \
   --dtype float32
 ```
 
-如果要验证 FLOAT16 模型，把运行参数里的 `--onnx-root` 改成 `./onnx_isolated_fp16` 即可。
+如果要验证 FLOAT16 模型，把运行参数里的 `--onnx-root` 改成 `./onnx_isolated_fp16` 即可。**如果验证的是 0.6B-Base，`tokenizer12hz_decode.onnx` 的 CUDA FP16 路径也可能遇到 CUDNN `ReduceSum` / `Conv` kernel 问题，建议先生成对应的 `*_fp32_islands` ONNX root。**
+
+```bash
+python scripts/onnx_export/patch_decoder_fp32_islands.py \
+  --onnx-root ./onnx_qwen3_tts_0p6b_base_fp16 \
+  --output-root ./onnx_qwen3_tts_0p6b_base_fp16_fp32_islands \
+  --overwrite
+```
 
 CLI 执行的完整路径：
 
@@ -82,6 +91,141 @@ CLI 执行的完整路径：
 talker_prefill/talker_decode/code_predictor -> 生成 codec codes
 参考 codes + 生成 codes -> tokenizer12hz_decode -> wav
 ```
+
+## CustomVoice CLI
+
+`qwen_custom_voice` 支持 `Qwen3-TTS-12Hz-0.6B-CustomVoice`。它不读取参考音频，也不加载
+`speaker_encoder` / `tokenizer12hz_encode`，音色条件来自模型配置里的预置 speaker id。
+
+先导出 CustomVoice ONNX：
+
+```bash
+python scripts/onnx_export/export_all_isolated_onnx.py \
+  --clean \
+  --model /home/zhang/.cache/modelscope/hub/models/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
+  --output-root ./onnx_custom_voice_0p6b_fp16 \
+  --device cuda \
+  --dtype float16 \
+  --skip-speaker-encoder
+```
+
+**0.6B-CustomVoice 和 0.6B-Base 一样，FP16 decoder CUDA 路径可能触发 CUDNN `ReduceSum` / `Conv` kernel 问题；如果要让 decoder 也走 CUDA，建议先修补 decoder：**
+
+```bash
+python scripts/onnx_export/patch_decoder_fp32_islands.py \
+  --onnx-root ./onnx_custom_voice_0p6b_fp16 \
+  --output-root ./onnx_custom_voice_0p6b_fp16_fp32_islands \
+  --overwrite
+```
+
+运行 C++ CustomVoice：
+
+```bash
+./cpp/build/qwen_custom_voice \
+  --model /home/zhang/.cache/modelscope/hub/models/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
+  --onnx-root ./onnx_custom_voice_0p6b_fp16 \
+  --text "你好，这是 C++ ONNX Runtime 自定义音色测试。" \
+  --language Chinese \
+  --speaker Vivian \
+  --max-new-tokens 120 \
+  --output output_custom_voice_cpp.wav
+```
+
+默认配置是主生成 CUDA、prep CPU、decode 跟随主 provider，也就是 CUDA。`--provider` 控制 talker/code predictor 等主生成图；
+`--prep-provider` 控制 text/codec embedding 等小图；`--decode-provider` 控制 `tokenizer12hz_decode.onnx`。
+当前环境里 decoder 全 CUDA 如果在 CUDNN Conv/ReduceSum kernel 上失败，再显式加 `--decode-provider CPUExecutionProvider`。
+**如果要测试 0.6B decoder 全 CUDA，把 `--onnx-root` 换成对应的 `*_fp32_islands` 目录；这个修补对 0.6B-Base 和 0.6B-CustomVoice 都适用。**
+
+常用 speaker 名称来自模型配置，当前 0.6B CustomVoice 包含：
+
+```text
+Vivian Serena Uncle_Fu Ryan Aiden Ono_Anna Sohee Eric Dylan
+```
+
+其中 `Eric` 和 `Dylan` 是方言音色；当 `--language Chinese` 或 `auto` 时，runtime 会按模型配置自动切到对应方言 language id。
+
+### CustomVoice 对齐验证
+
+Python ORT 和 PyTorch 的贪心对齐：
+
+```bash
+python scripts/onnx_runtime/compare_custom_voice_greedy.py \
+  --model /home/zhang/.cache/modelscope/hub/models/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
+  --onnx-root ./onnx_custom_voice_0p6b_fp16 \
+  --provider CUDAExecutionProvider \
+  --device cuda \
+  --dtype float16 \
+  --text "你好，这是 Qwen 三自定义音色的 GPU 贪心对齐测试。" \
+  --language Chinese \
+  --speaker Vivian \
+  --max-new-tokens 40 \
+  --output-dir compare_custom_voice_gpu_fp16_smoke
+```
+
+**如果对齐验证的是修补后的 0.6B decoder，把上面的 `--onnx-root` 换成 `./onnx_custom_voice_0p6b_fp16_fp32_islands`。**
+
+随后运行 C++，导出 codes：
+
+```bash
+./cpp/build/qwen_custom_voice \
+  --onnx-root ./onnx_custom_voice_0p6b_fp16 \
+  --model /home/zhang/.cache/modelscope/hub/models/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
+  --text "你好，这是 Qwen 三自定义音色的 GPU 贪心对齐测试。" \
+  --language Chinese \
+  --speaker Vivian \
+  --max-new-tokens 40 \
+  --greedy \
+  --output compare_custom_voice_gpu_fp16_smoke/cpp_custom_voice_greedy.wav \
+  --codes-output compare_custom_voice_gpu_fp16_smoke/cpp_custom_voice_codes.npy
+```
+
+对比 codes：
+
+```bash
+python - <<'PY'
+import numpy as np
+py = np.load("compare_custom_voice_gpu_fp16_smoke/ort_custom_voice_codes.npy")
+cpp = np.load("compare_custom_voice_gpu_fp16_smoke/cpp_custom_voice_codes.npy")
+print(py.shape, cpp.shape)
+print("exact:", np.array_equal(py, cpp))
+print("mismatch:", int(np.count_nonzero(py != cpp)))
+PY
+```
+
+已验证的结果：`(39, 16)` 对 `(39, 16)`，`exact: True`，`mismatch: 0`。C++ decoder 走 CPU 时，波形和 Python ORT 不是 bitwise 一样，但相关性约为 `0.999672`。
+
+## VoiceDesign CLI
+
+`qwen_voice_design` 支持 `Qwen3-TTS-12Hz-1.7B-VoiceDesign`。它不读取参考音频，也不加载
+`speaker_encoder` / `tokenizer12hz_encode`，音色条件来自 `--instruct` 文本。
+
+先导出 VoiceDesign ONNX：
+
+```bash
+python scripts/onnx_export/export_all_isolated_onnx.py \
+  --clean \
+  --model /home/zhang/.cache/modelscope/hub/models/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
+  --output-root ./onnx_voice_design_1p7b_fp16 \
+  --device cuda \
+  --dtype float16 \
+  --skip-speaker-encoder
+```
+
+运行 C++ VoiceDesign：
+
+```bash
+./cpp/build/qwen_voice_design \
+  --model /home/zhang/.cache/modelscope/hub/models/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
+  --onnx-root ./onnx_voice_design_1p7b_fp16 \
+  --text "你好，这是 C++ ONNX Runtime 音色设计测试。" \
+  --language Chinese \
+  --instruct "一个年轻女性的声音，语气温柔自然，语速适中，发音清晰。" \
+  --max-new-tokens 120 \
+  --output output_voice_design_cpp.wav
+```
+
+默认 provider 组合同 CustomVoice：主生成 CUDA、prep CPU、decode CUDA。已验证的短贪心结果：
+Python ORT 与 C++ 生成 codes 同为 `(39, 16)`，`exact: True`，`mismatch: 0`。
 
 ### 完整 decode
 
@@ -94,6 +238,7 @@ CLI 使用完整 decoder：
 完整 decode 路径保持为 C++ 的稳定基线，不受 chunk/pipeline 实验入口影响。
 如果 `tokenizer12hz_decode.onnx` 报告的有效长度大于实际输出长度，runtime 会直接报错，
 避免静默返回被 trace 长度截断的音频。
+**0.6B FP16 模型如果完整 decoder 走 CUDA 报 CUDNN 错误，优先使用 `--decode-provider CPUExecutionProvider`，或者把 `--onnx-root` 指向对应的 `*_fp32_islands` 目录再测试。**
 
 推荐验证命令：
 

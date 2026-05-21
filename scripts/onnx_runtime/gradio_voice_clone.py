@@ -19,7 +19,7 @@ from voice_clone_ort import DEFAULT_MODEL, Qwen3TTSVoiceCloneORT
 
 
 DEFAULT_TEXT = "你好，这是使用 ONNX Runtime 进行非流式声音克隆的测试。"
-DEFAULT_REF_AUDIO = "./data/林志玲.mp3"
+DEFAULT_REF_AUDIO = "./data/ref_from_mp3_24k_mono.wav"
 DEFAULT_REF_TEXT = "告诉自己，不要怕"
 
 

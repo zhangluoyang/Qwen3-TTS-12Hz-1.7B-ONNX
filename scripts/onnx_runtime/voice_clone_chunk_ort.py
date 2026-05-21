@@ -25,7 +25,7 @@ def main() -> None:
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--onnx-root", default="./onnx_isolated_fp16")
     parser.add_argument("--text", default="你好，这是 Python chunk 流水线解码测试。")
-    parser.add_argument("--ref-audio", default="./data/林志玲.mp3")
+    parser.add_argument("--ref-audio", default="./data/ref_from_mp3_24k_mono.wav")
     parser.add_argument("--ref-text", default="告诉自己，不要怕")
     parser.add_argument("--language", default="auto")
     parser.add_argument("--output", default="output_voice_clone_chunk_ort.wav")

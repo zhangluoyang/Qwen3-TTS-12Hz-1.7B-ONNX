@@ -42,7 +42,7 @@ def main():
     parser.add_argument("--model", default="/home/zhang/.cache/modelscope/hub/models/Qwen/Qwen3-TTS-12Hz-1.7B-Base")
     parser.add_argument("--onnx-root", default="./onnx_isolated")
     parser.add_argument("--text", default="我和我的祖国，一刻也不能分割")
-    parser.add_argument("--ref-audio", default="./data/林志玲.mp3")
+    parser.add_argument("--ref-audio", default="./data/ref_from_mp3_24k_mono.wav")
     parser.add_argument("--ref-text", default="告诉自己，不要怕")
     parser.add_argument("--language", default="auto")
     parser.add_argument("--max-new-tokens", type=int, default=20)
