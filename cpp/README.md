@@ -65,18 +65,21 @@ CMake 辅助脚本会使用当前 Python 环境中的 ONNX Runtime GPU 动态库
 `onnx_isolated` 和 `onnx_isolated_fp16` 都可以用于验证。导出 FP32 模型示例：
 
 ```bash
-python scripts/onnx_export/export_all_isolated_onnx.py \
+python scripts/onnx_export/export.py all \
   --clean \
   --model /home/zhang/.cache/modelscope/hub/models/Qwen/Qwen3-TTS-12Hz-1.7B-Base \
   --output-root ./onnx_isolated \
   --device cuda \
-  --dtype float32
+  --dtype float32 \
+  --with-chunk-decoder \
+  --chunk-size 300 \
+  --left-context-size 25
 ```
 
 如果要验证 FLOAT16 模型，把运行参数里的 `--onnx-root` 改成 `./onnx_isolated_fp16` 即可。**如果验证的是 0.6B-Base，`tokenizer12hz_decode.onnx` 的 CUDA FP16 路径也可能遇到 CUDNN `ReduceSum` / `Conv` kernel 问题，建议先生成对应的 `*_fp32_islands` ONNX root。**
 
 ```bash
-python scripts/onnx_export/patch_decoder_fp32_islands.py \
+python scripts/onnx_export/export.py patch-decoder \
   --onnx-root ./onnx_qwen3_tts_0p6b_base_fp16 \
   --output-root ./onnx_qwen3_tts_0p6b_base_fp16_fp32_islands \
   --overwrite
@@ -100,19 +103,22 @@ talker_prefill/talker_decode/code_predictor -> 生成 codec codes
 先导出 CustomVoice ONNX：
 
 ```bash
-python scripts/onnx_export/export_all_isolated_onnx.py \
+python scripts/onnx_export/export.py all \
   --clean \
   --model /home/zhang/.cache/modelscope/hub/models/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
   --output-root ./onnx_custom_voice_0p6b_fp16 \
   --device cuda \
   --dtype float16 \
-  --skip-speaker-encoder
+  --skip-speaker-encoder \
+  --with-chunk-decoder \
+  --chunk-size 300 \
+  --left-context-size 25
 ```
 
 **0.6B-CustomVoice 和 0.6B-Base 一样，FP16 decoder CUDA 路径可能触发 CUDNN `ReduceSum` / `Conv` kernel 问题；如果要让 decoder 也走 CUDA，建议先修补 decoder：**
 
 ```bash
-python scripts/onnx_export/patch_decoder_fp32_islands.py \
+python scripts/onnx_export/export.py patch-decoder \
   --onnx-root ./onnx_custom_voice_0p6b_fp16 \
   --output-root ./onnx_custom_voice_0p6b_fp16_fp32_islands \
   --overwrite
@@ -149,12 +155,12 @@ Vivian Serena Uncle_Fu Ryan Aiden Ono_Anna Sohee Eric Dylan
 Python ORT 和 PyTorch 的贪心对齐：
 
 ```bash
-python scripts/onnx_runtime/compare_custom_voice_greedy.py \
+python scripts/verify_onnx.py \
   --model /home/zhang/.cache/modelscope/hub/models/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
   --onnx-root ./onnx_custom_voice_0p6b_fp16 \
   --provider CUDAExecutionProvider \
   --device cuda \
-  --dtype float16 \
+  --torch-dtype float16 \
   --text "你好，这是 Qwen 三自定义音色的 GPU 贪心对齐测试。" \
   --language Chinese \
   --speaker Vivian \
@@ -202,13 +208,16 @@ PY
 先导出 VoiceDesign ONNX：
 
 ```bash
-python scripts/onnx_export/export_all_isolated_onnx.py \
+python scripts/onnx_export/export.py all \
   --clean \
   --model /home/zhang/.cache/modelscope/hub/models/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
   --output-root ./onnx_voice_design_1p7b_fp16 \
   --device cuda \
   --dtype float16 \
-  --skip-speaker-encoder
+  --skip-speaker-encoder \
+  --with-chunk-decoder \
+  --chunk-size 300 \
+  --left-context-size 25
 ```
 
 运行 C++ VoiceDesign：
@@ -259,9 +268,9 @@ CLI 使用完整 decoder：
 
 ### Chunk/pipeline decode
 
-新增的 chunk CLI 使用 `tokenizer12hz_decode_chunk.onnx`。talker 仍逐帧生成 codec，
+chunk CLI 使用 `tokenizer12hz_decode_chunk.onnx`。talker 仍逐帧生成 codec，
 每攒够 `--chunk-frames` 帧就解码一段音频，最后再解码不足一段的尾巴。
-这个入口是独立可执行程序，不会改变原来的 `qwen_voice_clone` 完整 decode 行为。
+这些入口是独立可执行程序，不会改变原来的完整 decode 行为。
 
 ```bash
 ./cpp/build/qwen_voice_clone_chunk \
@@ -272,11 +281,39 @@ CLI 使用完整 decoder：
   --ref-audio ./data/林志玲.mp3 \
   --ref-text "告诉自己，不要怕" \
   --max-new-tokens 80 \
-  --chunk-frames 20 \
+  --chunk-frames 300 \
   --left-context-frames 25 \
   --crossfade-ms 20 \
   --greedy \
   --output output_voice_clone_cpp_chunk.wav
+```
+
+```bash
+./cpp/build/qwen_custom_voice_chunk \
+  --model /home/zhang/.cache/modelscope/hub/models/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --onnx-root ./onnx_custom_voice_1p7b_fp16 \
+  --provider CUDAExecutionProvider \
+  --text "你好，这是 C++ CustomVoice chunk 解码测试。" \
+  --speaker Vivian \
+  --max-new-tokens 80 \
+  --chunk-frames 30 \
+  --left-context-frames 25 \
+  --chunk-dir ./custom_voice_chunks \
+  --output output_custom_voice_cpp_chunk.wav
+```
+
+```bash
+./cpp/build/qwen_voice_design_chunk \
+  --model /home/zhang/.cache/modelscope/hub/models/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
+  --onnx-root ./onnx_voice_design_1p7b_fp16 \
+  --provider CUDAExecutionProvider \
+  --text "你好，这是 C++ VoiceDesign chunk 解码测试。" \
+  --instruct "一个年轻女性的声音，语气温柔自然，语速适中，发音清晰。" \
+  --max-new-tokens 80 \
+  --chunk-frames 30 \
+  --left-context-frames 25 \
+  --chunk-dir ./voice_design_chunks \
+  --output output_voice_design_cpp_chunk.wav
 ```
 
 `--crossfade-ms` 默认为 0，表示直接拼接每个 chunk；如果边界听起来一段一段的，

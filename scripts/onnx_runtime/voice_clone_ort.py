@@ -409,7 +409,7 @@ class Qwen3TTSVoiceCloneORT:
         if not path.exists():
             raise FileNotFoundError(
                 f"Chunk decoder not found: {path}. "
-                "Export it explicitly with export_tokenizer12hz_onnx.py --export-chunk-decoder."
+                "Export it with scripts/export_onnx.py, or run scripts/onnx_export/export.py tokenizer --export-chunk-decoder."
             )
         self.tokenizer_decode_chunk = make_session(
             path,
@@ -737,6 +737,40 @@ class Qwen3TTSVoiceCloneORT:
             )
         return audio.reshape(-1)[:expected_samples].astype(np.float32), 24000
 
+    def decode_codes_to_audio_chunked(self, codes, chunk_frames=300, left_context_frames=25):
+        """Decode a complete [frames, 16] codec sequence with the chunk decoder.
+
+        This mirrors the upstream PyTorch 12Hz tokenizer's chunked_decode()
+        default behavior: current chunk size 300 frames and 25 frames of left
+        context. Unlike tokenizer12hz_decode.onnx, the chunk decoder is safe for
+        arbitrarily long generated code sequences.
+        """
+        codes = np.asarray(codes, dtype=np.int64)
+        if codes.ndim != 2 or codes.shape[1] != self.num_code_groups:
+            raise ValueError(f"codes must have shape [frames, {self.num_code_groups}], got {codes.shape}")
+        chunk_frames = int(chunk_frames)
+        left_context_frames = int(left_context_frames)
+        if chunk_frames <= 0:
+            raise ValueError("chunk_frames must be positive")
+        if left_context_frames < 0:
+            raise ValueError("left_context_frames must be non-negative")
+        if codes.shape[0] == 0:
+            return np.zeros((0,), dtype=np.float32), 24000
+
+        chunks = []
+        start_frame = 0
+        while start_frame < codes.shape[0]:
+            end_frame = min(start_frame + chunk_frames, codes.shape[0])
+            wav, sr = self.decode_codes_chunk_to_audio(
+                codes,
+                start_frame,
+                end_frame,
+                left_context_frames=left_context_frames,
+            )
+            chunks.append(wav.astype(np.float32, copy=False))
+            start_frame = end_frame
+        return np.concatenate(chunks).astype(np.float32, copy=False), sr
+
     def generate_voice_clone(
         self,
         text,
@@ -961,7 +995,7 @@ class Qwen3TTSVoiceCloneORT:
         ref_text,
         language="auto",
         max_new_tokens=300,
-        chunk_frames=50,
+        chunk_frames=300,
         left_context_frames=25,
         x_vector_only_mode=False,
         do_sample=None,

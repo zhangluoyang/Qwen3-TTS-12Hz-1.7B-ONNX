@@ -112,6 +112,9 @@ class Qwen3TTSVoiceDesignORT(Qwen3TTSVoiceCloneORT):
         subtalker_temperature=None,
         cancel_event=None,
         dump_dir=None,
+        use_chunk_decoder=True,
+        chunk_frames=300,
+        left_context_frames=25,
         verbose=True,
     ):
         gen = self.generation_config
@@ -201,7 +204,14 @@ class Qwen3TTSVoiceDesignORT(Qwen3TTSVoiceCloneORT):
         if not generated_codes:
             raise RuntimeError("No codec frames were generated before EOS")
         codes = np.stack(generated_codes, axis=0).astype(np.int64)
-        wav, sr = self.decode_codes_to_audio(codes)
+        if use_chunk_decoder:
+            wav, sr = self.decode_codes_to_audio_chunked(
+                codes,
+                chunk_frames=chunk_frames,
+                left_context_frames=left_context_frames,
+            )
+        else:
+            wav, sr = self.decode_codes_to_audio(codes)
         if dump_dir:
             np.save(dump_dir / "generated_codes.npy", codes)
             np.save(dump_dir / "waveform.npy", wav.astype(np.float32))
@@ -222,6 +232,9 @@ def main():
     parser.add_argument("--greedy", action="store_true")
     parser.add_argument("--dump-dir", default="")
     parser.add_argument("--no-iobinding", action="store_true")
+    parser.add_argument("--legacy-full-decoder", action="store_true")
+    parser.add_argument("--chunk-frames", type=int, default=300)
+    parser.add_argument("--left-context-frames", type=int, default=25)
     args = parser.parse_args()
 
     runner = Qwen3TTSVoiceDesignORT(
@@ -239,6 +252,9 @@ def main():
         do_sample=False if args.greedy else None,
         subtalker_dosample=False if args.greedy else None,
         dump_dir=args.dump_dir or None,
+        use_chunk_decoder=not args.legacy_full_decoder,
+        chunk_frames=args.chunk_frames,
+        left_context_frames=args.left_context_frames,
         verbose=True,
     )
     sf.write(args.output, wav, sr)

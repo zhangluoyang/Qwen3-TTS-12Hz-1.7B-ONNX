@@ -683,6 +683,13 @@ FloatTensor VoiceCloneRuntime::DecodeCodes(const Int64Tensor& codes, int64_t* ou
   if (audio.shape().size() == 2 && audio.shape()[0] == 1) {
     audio.shape() = {audio.shape()[1]};
   }
+  if (len >= 0 && static_cast<size_t>(len) > audio.values().size()) {
+    throw std::runtime_error("tokenizer_decode output is shorter than its reported length: audio_samples=" +
+                             std::to_string(audio.values().size()) + ", expected_samples=" +
+                             std::to_string(len) +
+                             ". The exported tokenizer12hz_decode.onnx is likely capped by its trace length; "
+                             "use a larger --decode-trace-frames export or the chunk decoder path.");
+  }
   if (len >= 0 && static_cast<size_t>(len) < audio.values().size()) {
     // 部分导出图会返回 padding 后的 audio_values 和真实 lengths；这里按真实长度裁剪。
     audio.values().resize(static_cast<size_t>(len));
@@ -1386,11 +1393,18 @@ VoiceCloneResult VoiceCloneRuntime::GenerateFromPrompt(const FloatTensor& prompt
   return result;
 }
 
-VoiceCloneChunkedResult VoiceCloneRuntime::GenerateFromPreparedChunked(
-    const VoiceCloneInputs& inputs,
+VoiceCloneChunkedResult VoiceCloneRuntime::GenerateFromPromptChunked(
+    const FloatTensor& prompt,
+    const FloatTensor& trailing_text,
+    const FloatTensor& tts_pad,
+    const Int64Tensor& reference_codes,
+    int max_new_tokens,
+    const SamplingOptions& main_sampling,
+    const SamplingOptions& code_sampling,
+    const std::filesystem::path& debug_dump_dir,
     const VoiceCloneChunkOptions& chunk_options,
     const VoiceCloneChunkCallback& on_chunk) {
-  // chunked 路径复用和 GenerateFromPrepared() 相同的生成逻辑，只是每攒够
+  // chunked 路径复用和 GenerateFromPrompt() 相同的生成逻辑，只是每攒够
   // chunk_frames 帧就立刻调用 tokenizer_decode_chunk 并回调一段音频。
   if (chunk_options.chunk_frames <= 0) throw std::invalid_argument("chunk_frames must be positive");
   if (chunk_options.left_context_frames < 0) throw std::invalid_argument("left_context_frames must be non-negative");
@@ -1402,9 +1416,6 @@ VoiceCloneChunkedResult VoiceCloneRuntime::GenerateFromPreparedChunked(
 
   const auto total_start = Clock::now();
   const bool trace_tokens = std::getenv("QWEN_TRACE_TOKENS") != nullptr;
-  FloatTensor trailing_text;
-  FloatTensor tts_pad;
-  auto prompt = BuildTalkerPrompt(inputs, &trailing_text, &tts_pad);
 
   auto attention_mask = Int64Tensor({1, prompt.shape()[1]}, std::vector<int64_t>(static_cast<size_t>(prompt.shape()[1]), 1));
   std::unordered_map<std::string, Ort::Value> prefill_kv_inputs;
@@ -1428,20 +1439,20 @@ VoiceCloneChunkedResult VoiceCloneRuntime::GenerateFromPreparedChunked(
 
   std::vector<float> next_logits = LastLogits(prefill_outputs[0]);
   auto last_hidden = LastHidden(prefill_outputs[1]);
-  if (!inputs.debug_dump_dir.empty()) {
-    WriteNpy(inputs.debug_dump_dir / "prompt.npy", prompt.values(), prompt.shape());
-    WriteNpy(inputs.debug_dump_dir / "prefill_logits_last.npy", next_logits, {config_.talker.vocab_size});
+  if (!debug_dump_dir.empty()) {
+    WriteNpy(debug_dump_dir / "prompt.npy", prompt.values(), prompt.shape());
+    WriteNpy(debug_dump_dir / "prefill_logits_last.npy", next_logits, {config_.talker.vocab_size});
     auto last_hidden_full = CopyFloatTensor(prefill_outputs[1]);
-    WriteNpy(inputs.debug_dump_dir / "prefill_last_hidden_full.npy", last_hidden_full.values(), last_hidden_full.shape());
+    WriteNpy(debug_dump_dir / "prefill_last_hidden_full.npy", last_hidden_full.values(), last_hidden_full.shape());
   }
   std::vector<Ort::Value> past;
   past.reserve(static_cast<size_t>(config_.talker.num_hidden_layers * 2));
   for (size_t i = 2; i < prefill_outputs.size(); ++i) past.emplace_back(std::move(prefill_outputs[i]));
-  if (!inputs.debug_dump_dir.empty() && !past.empty()) {
+  if (!debug_dump_dir.empty() && !past.empty()) {
     auto k0 = CopyFloatTensor(past[0]);
     auto v0 = CopyFloatTensor(past[1]);
-    WriteNpy(inputs.debug_dump_dir / "prefill_past_key_0.npy", k0.values(), k0.shape());
-    WriteNpy(inputs.debug_dump_dir / "prefill_past_value_0.npy", v0.values(), v0.shape());
+    WriteNpy(debug_dump_dir / "prefill_past_key_0.npy", k0.values(), k0.shape());
+    WriteNpy(debug_dump_dir / "prefill_past_value_0.npy", v0.values(), v0.shape());
   }
 
   VoiceCloneChunkedResult result;
@@ -1449,20 +1460,20 @@ VoiceCloneChunkedResult VoiceCloneRuntime::GenerateFromPreparedChunked(
   std::vector<int64_t> first_tokens;
   std::vector<int64_t> generated_flat;
   std::vector<float> waveform;
-  const int64_t ref_frames = inputs.reference_codes.empty() ? 0 : inputs.reference_codes.shape()[0];
+  const int64_t ref_frames = reference_codes.empty() ? 0 : reference_codes.shape()[0];
   // full_codes 坐标中 [0, ref_frames) 是参考音频，不能发给用户播放。
   int64_t next_decode_start = ref_frames;
   size_t next_chunk_index = 0;
   size_t next_emit_index = 0;
   int64_t past_len = prompt.shape()[1];
-  const int max_frames = std::max(inputs.max_new_tokens - 1, 1);
+  const int max_frames = std::max(max_new_tokens - 1, 1);
 
   auto decode_task = [&](ChunkDecodeTask task) -> ChunkDecodeResult {
     // 这个 lambda 同时服务同步和异步 chunk decode，保证两条路径行为一致。
     const auto chunk_start = Clock::now();
     auto audio = DecodeCodesChunk(task.full_codes, task.start_frame, task.end_frame, task.left_context_frames);
     AddTiming(task.is_final ? "pipeline.decode_final_chunk" : "pipeline.decode_chunk", ElapsedMs(chunk_start));
-    DumpChunkDebug(inputs.debug_dump_dir,
+    DumpChunkDebug(debug_dump_dir,
                    task.index,
                    task.full_codes,
                    audio,
@@ -1572,10 +1583,10 @@ VoiceCloneChunkedResult VoiceCloneRuntime::GenerateFromPreparedChunked(
     }
     AddTiming("generation.last_logits_filter", ElapsedMs(logits_filter_start));
     const auto sample_start = Clock::now();
-    int64_t first = sampler_.Sample(filtered_logits, inputs.main_sampling, first_tokens);
-    if (!inputs.debug_dump_dir.empty()) {
+    int64_t first = sampler_.Sample(filtered_logits, main_sampling, first_tokens);
+    if (!debug_dump_dir.empty()) {
       int64_t forced = 0;
-      const auto forced_path = inputs.debug_dump_dir / ("first_token_pick_f" + std::to_string(frame) + ".npy");
+      const auto forced_path = debug_dump_dir / ("first_token_pick_f" + std::to_string(frame) + ".npy");
       if (ReadNpyInt64Scalar(forced_path, &forced)) {
         first = forced;
       }
@@ -1590,17 +1601,17 @@ VoiceCloneChunkedResult VoiceCloneRuntime::GenerateFromPreparedChunked(
                 << (first == config_.talker.codec_eos_token_id ? " hit_eos=1" : " hit_eos=0")
                 << "\n";
     }
-    if (!inputs.debug_dump_dir.empty()) {
-      WriteNpy(inputs.debug_dump_dir / ("first_token_logits_f" + std::to_string(frame) + ".npy"),
+    if (!debug_dump_dir.empty()) {
+      WriteNpy(debug_dump_dir / ("first_token_logits_f" + std::to_string(frame) + ".npy"),
                filtered_logits, {static_cast<int64_t>(filtered_logits.size())});
-      WriteNpy(inputs.debug_dump_dir / ("first_token_pick_f" + std::to_string(frame) + ".npy"),
+      WriteNpy(debug_dump_dir / ("first_token_pick_f" + std::to_string(frame) + ".npy"),
                std::vector<int64_t>{first}, {1});
     }
     if (first == config_.talker.codec_eos_token_id) {
       break;
     }
     first_tokens.push_back(first);
-    auto [row, frame_embed] = RunCodePredictor(last_hidden, first, inputs.code_sampling, frame, inputs.debug_dump_dir);
+    auto [row, frame_embed] = RunCodePredictor(last_hidden, first, code_sampling, frame, debug_dump_dir);
     const auto append_codes_start = Clock::now();
     generated_flat.insert(generated_flat.end(), row.begin(), row.end());
     AddTiming("generation.append_generated_codes", ElapsedMs(append_codes_start));
@@ -1610,15 +1621,15 @@ VoiceCloneChunkedResult VoiceCloneRuntime::GenerateFromPreparedChunked(
                                     ? Add(frame_embed, SliceAxis1(trailing_text, frame, frame + 1))
                                     : Add(frame_embed, tts_pad);
     AddTiming("generation.build_decode_embed", ElapsedMs(decode_embed_start));
-    if (!inputs.debug_dump_dir.empty() && frame == 0) {
-      WriteNpy(inputs.debug_dump_dir / "decode0_inputs_embeds.npy", decode_embed.values(), decode_embed.shape());
-      WriteNpy(inputs.debug_dump_dir / "decode0_attention_mask.npy",
+    if (!debug_dump_dir.empty() && frame == 0) {
+      WriteNpy(debug_dump_dir / "decode0_inputs_embeds.npy", decode_embed.values(), decode_embed.shape());
+      WriteNpy(debug_dump_dir / "decode0_attention_mask.npy",
                std::vector<int64_t>(static_cast<size_t>(past_len + 2), 1), {1, past_len + 2});
-      WriteNpy(inputs.debug_dump_dir / "decode0_cache_position.npy", std::vector<int64_t>{past_len}, {1});
+      WriteNpy(debug_dump_dir / "decode0_cache_position.npy", std::vector<int64_t>{past_len}, {1});
       auto k0 = CopyFloatTensor(past[0]);
       auto v0 = CopyFloatTensor(past[1]);
-      WriteNpy(inputs.debug_dump_dir / "decode0_past_key_0.npy", k0.values(), k0.shape());
-      WriteNpy(inputs.debug_dump_dir / "decode0_past_value_0.npy", v0.values(), v0.shape());
+      WriteNpy(debug_dump_dir / "decode0_past_key_0.npy", k0.values(), k0.shape());
+      WriteNpy(debug_dump_dir / "decode0_past_value_0.npy", v0.values(), v0.shape());
     }
     const auto feed_start = Clock::now();
     std::unordered_map<std::string, Ort::Value> feeds;
@@ -1643,10 +1654,10 @@ VoiceCloneChunkedResult VoiceCloneRuntime::GenerateFromPreparedChunked(
     const auto decode_copy_start = Clock::now();
     next_logits = LastLogits(out[0]);
     last_hidden = LastHidden(out[1]);
-    if (!inputs.debug_dump_dir.empty() && frame == 0) {
-      WriteNpy(inputs.debug_dump_dir / "decode0_logits_last.npy", next_logits, {config_.talker.vocab_size});
+    if (!debug_dump_dir.empty() && frame == 0) {
+      WriteNpy(debug_dump_dir / "decode0_logits_last.npy", next_logits, {config_.talker.vocab_size});
       auto hidden_full = CopyFloatTensor(out[1]);
-      WriteNpy(inputs.debug_dump_dir / "decode0_last_hidden.npy", hidden_full.values(), hidden_full.shape());
+      WriteNpy(debug_dump_dir / "decode0_last_hidden.npy", hidden_full.values(), hidden_full.shape());
     }
     AddTiming("generation.talker_decode_copy_outputs", ElapsedMs(decode_copy_start));
     const auto past_move_start = Clock::now();
@@ -1664,11 +1675,11 @@ VoiceCloneChunkedResult VoiceCloneRuntime::GenerateFromPreparedChunked(
       const int64_t end_frame = next_decode_start + chunk_options.chunk_frames;
       const auto prepare_start = Clock::now();
       Int64Tensor full_codes({ref_frames + generated_frames, config_.talker.num_code_groups});
-      if (!inputs.reference_codes.empty()) {
-        std::copy(inputs.reference_codes.values().begin(), inputs.reference_codes.values().end(), full_codes.values().begin());
+      if (!reference_codes.empty()) {
+        std::copy(reference_codes.values().begin(), reference_codes.values().end(), full_codes.values().begin());
       }
       std::copy(generated_flat.begin(), generated_flat.end(),
-                full_codes.values().begin() + static_cast<long>(inputs.reference_codes.size()));
+                full_codes.values().begin() + static_cast<long>(reference_codes.size()));
       AddTiming("pipeline.prepare_chunk_codes", ElapsedMs(prepare_start));
       submit_chunk_decode(std::move(full_codes), next_decode_start, end_frame, generated_frames, false);
       next_decode_start = end_frame;
@@ -1685,11 +1696,11 @@ VoiceCloneChunkedResult VoiceCloneRuntime::GenerateFromPreparedChunked(
     // 最后一段通常不足 chunk_frames，也要解码并标记 is_final=true。
     const auto prepare_start = Clock::now();
     Int64Tensor full_codes({ref_frames + generated_frames, config_.talker.num_code_groups});
-    if (!inputs.reference_codes.empty()) {
-      std::copy(inputs.reference_codes.values().begin(), inputs.reference_codes.values().end(), full_codes.values().begin());
+    if (!reference_codes.empty()) {
+      std::copy(reference_codes.values().begin(), reference_codes.values().end(), full_codes.values().begin());
     }
     std::copy(generated_flat.begin(), generated_flat.end(),
-              full_codes.values().begin() + static_cast<long>(inputs.reference_codes.size()));
+              full_codes.values().begin() + static_cast<long>(reference_codes.size()));
     AddTiming("pipeline.prepare_final_chunk_codes", ElapsedMs(prepare_start));
     submit_chunk_decode(std::move(full_codes), next_decode_start, final_end, generated_frames, true);
   }
@@ -1698,6 +1709,25 @@ VoiceCloneChunkedResult VoiceCloneRuntime::GenerateFromPreparedChunked(
   result.waveform = FloatTensor({waveform_samples}, std::move(waveform));
   AddTiming("total.generate_from_prepared_chunked", ElapsedMs(total_start));
   return result;
+}
+
+VoiceCloneChunkedResult VoiceCloneRuntime::GenerateFromPreparedChunked(
+    const VoiceCloneInputs& inputs,
+    const VoiceCloneChunkOptions& chunk_options,
+    const VoiceCloneChunkCallback& on_chunk) {
+  FloatTensor trailing_text;
+  FloatTensor tts_pad;
+  auto prompt = BuildTalkerPrompt(inputs, &trailing_text, &tts_pad);
+  return GenerateFromPromptChunked(prompt,
+                                   trailing_text,
+                                   tts_pad,
+                                   inputs.reference_codes,
+                                   inputs.max_new_tokens,
+                                   inputs.main_sampling,
+                                   inputs.code_sampling,
+                                   inputs.debug_dump_dir,
+                                   chunk_options,
+                                   on_chunk);
 }
 
 VoiceCloneResult VoiceCloneRuntime::GenerateVoiceClone(const VoiceCloneRequest& request) {
@@ -1763,6 +1793,59 @@ VoiceCloneResult VoiceCloneRuntime::GenerateVoiceDesign(const VoiceDesignRequest
                                    request.code_sampling,
                                    request.debug_dump_dir);
   AddTiming("total.generate_voice_design", ElapsedMs(total_start));
+  return result;
+}
+
+VoiceCloneChunkedResult VoiceCloneRuntime::GenerateCustomVoiceChunked(
+    const CustomVoiceRequest& request,
+    const VoiceCloneChunkOptions& chunk_options,
+    const VoiceCloneChunkCallback& on_chunk) {
+  const auto total_start = Clock::now();
+  if (config_.tts_model_type != "custom_voice") {
+    throw std::runtime_error("GenerateCustomVoiceChunked requires a custom_voice model, got: " + config_.tts_model_type);
+  }
+  if (!request.instruct.empty()) {
+    AddTiming("prep.custom_voice_instruct_ignored", 0.0);
+  }
+  FloatTensor trailing_text;
+  FloatTensor tts_pad;
+  auto prompt = BuildCustomVoicePrompt(request, &trailing_text, &tts_pad);
+  auto result = GenerateFromPromptChunked(prompt,
+                                          trailing_text,
+                                          tts_pad,
+                                          Int64Tensor{},
+                                          request.max_new_tokens,
+                                          request.main_sampling,
+                                          request.code_sampling,
+                                          request.debug_dump_dir,
+                                          chunk_options,
+                                          on_chunk);
+  AddTiming("total.generate_custom_voice_chunked", ElapsedMs(total_start));
+  return result;
+}
+
+VoiceCloneChunkedResult VoiceCloneRuntime::GenerateVoiceDesignChunked(
+    const VoiceDesignRequest& request,
+    const VoiceCloneChunkOptions& chunk_options,
+    const VoiceCloneChunkCallback& on_chunk) {
+  const auto total_start = Clock::now();
+  if (config_.tts_model_type != "voice_design") {
+    throw std::runtime_error("GenerateVoiceDesignChunked requires a voice_design model, got: " + config_.tts_model_type);
+  }
+  FloatTensor trailing_text;
+  FloatTensor tts_pad;
+  auto prompt = BuildVoiceDesignPrompt(request, &trailing_text, &tts_pad);
+  auto result = GenerateFromPromptChunked(prompt,
+                                          trailing_text,
+                                          tts_pad,
+                                          Int64Tensor{},
+                                          request.max_new_tokens,
+                                          request.main_sampling,
+                                          request.code_sampling,
+                                          request.debug_dump_dir,
+                                          chunk_options,
+                                          on_chunk);
+  AddTiming("total.generate_voice_design_chunked", ElapsedMs(total_start));
   return result;
 }
 

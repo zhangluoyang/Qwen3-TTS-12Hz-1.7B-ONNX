@@ -10,7 +10,9 @@ the normal export flow in one command:
 """
 
 import argparse
+import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -37,10 +39,45 @@ def parse_dtype(value: str) -> str:
     return aliases[normalized]
 
 
-def default_output_root(dtype: str) -> Path:
-    if dtype == "float16":
-        return REPO_ROOT / "onnx_isolated_fp16"
-    return REPO_ROOT / "onnx_isolated"
+def load_model_config(model: str) -> dict:
+    """Load config.json for local model paths; fall back to name inference."""
+    model_path = Path(model).expanduser()
+    config_path = model_path / "config.json"
+    if config_path.exists():
+        with config_path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def infer_model_type(model: str, config: dict) -> str:
+    model_type = config.get("tts_model_type")
+    if model_type:
+        return str(model_type)
+
+    name = Path(model).name.lower()
+    if "customvoice" in name or "custom_voice" in name:
+        return "custom_voice"
+    if "voicedesign" in name or "voice_design" in name:
+        return "voice_design"
+    return "base"
+
+
+def infer_size_label(model: str) -> str:
+    name = Path(model).name.lower().replace("___", ".").replace("_", ".")
+    match = re.search(r"(\d+(?:\.\d+)?)b", name)
+    if not match:
+        return "model"
+    return match.group(1).replace(".", "p") + "b"
+
+
+def default_output_root(model: str, model_type: str, dtype: str) -> Path:
+    type_names = {
+        "base": "base",
+        "custom_voice": "custom_voice",
+        "voice_design": "voice_design",
+    }
+    dtype_label = "fp16" if dtype == "float16" else "fp32"
+    return REPO_ROOT / f"onnx_{type_names.get(model_type, model_type)}_{infer_size_label(model)}_{dtype_label}"
 
 
 def default_device(dtype: str) -> str:
@@ -65,8 +102,8 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--dtype",
         type=parse_dtype,
-        default="float32",
-        help="Export dtype: float32/fp32 or float16/fp16. Default: float32.",
+        default="float16",
+        help="Export dtype: float32/fp32 or float16/fp16. Default: fp16.",
     )
     parser.add_argument(
         "--device",
@@ -76,12 +113,12 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--output-root",
         default=None,
-        help="Directory that will contain tokenizer12hz/, text_project/, talker_decode/, etc.",
+        help="Output directory. Default is inferred from model type/size/dtype.",
     )
     parser.add_argument(
         "--clean",
         action="store_true",
-        help="Delete output-root before exporting. Passed through to export_all_isolated_onnx.py.",
+        help="Delete output-root before exporting.",
     )
     parser.add_argument(
         "--skip-consolidate",
@@ -93,15 +130,22 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="When consolidating, keep old split external-data files instead of removing them.",
     )
+    parser.add_argument("--with-chunk-decoder", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
-        "--with-chunk-decoder",
+        "--no-chunk-decoder",
         action="store_true",
-        help="Also export tokenizer12hz_decode_chunk.onnx for chunk/pipeline runtime.",
+        help="Do not export tokenizer12hz_decode_chunk.onnx. Default: export it.",
+    )
+    parser.add_argument("--skip-speaker-encoder", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--include-speaker-encoder",
+        action="store_true",
+        help="Force speaker_encoder export even for CustomVoice/VoiceDesign.",
     )
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=50,
+        default=300,
         help="Codec frame count used when tracing tokenizer12hz_decode_chunk.onnx.",
     )
     parser.add_argument(
@@ -120,8 +164,8 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Export Qwen3-TTS ONNX submodels with the repository's isolated export flow. "
-            "Examples: --dtype fp32 --clean, or --dtype fp16 --device cuda --clean."
+            "Export Qwen3-TTS ONNX submodels. The model type is inferred from config.json; "
+            "chunk decoder and external-data consolidation are enabled by default."
         )
     )
     add_common_args(parser)
@@ -133,17 +177,17 @@ def main() -> None:
 
     dtype = args.dtype
     device = default_device(dtype) if args.device == "auto" else args.device
-    output_root = Path(args.output_root) if args.output_root else default_output_root(dtype)
+    config = load_model_config(args.model)
+    model_type = infer_model_type(args.model, config)
+    output_root = Path(args.output_root) if args.output_root else default_output_root(args.model, model_type, dtype)
     output_root = output_root.expanduser()
     if not output_root.is_absolute():
         output_root = REPO_ROOT / output_root
 
     py = sys.executable
-    export_all = ONNX_EXPORT_DIR / "export_all_isolated_onnx.py"
-    tokenizer_export = ONNX_EXPORT_DIR / "export_tokenizer12hz_onnx.py"
-    consolidate = ONNX_EXPORT_DIR / "consolidate_external_data.py"
+    export_impl = ONNX_EXPORT_DIR / "export.py"
 
-    missing = [path for path in (export_all, tokenizer_export, consolidate) if not path.exists()]
+    missing = [path for path in (export_impl,) if not path.exists()]
     if missing:
         for path in missing:
             print(f"missing required script: {path}", file=sys.stderr)
@@ -155,13 +199,17 @@ def main() -> None:
 
     print("Qwen3-TTS ONNX export")
     print(f"  model:       {args.model}")
+    print(f"  model-type:  {model_type}")
     print(f"  dtype:       {dtype}")
     print(f"  device:      {device}")
     print(f"  output-root: {output_root}")
+    print(f"  chunk:       {not args.no_chunk_decoder}")
+    print(f"  consolidate: {not args.skip_consolidate}")
 
     export_cmd = [
         py,
-        str(export_all),
+        str(export_impl),
+        "all",
         "--model",
         args.model,
         "--output-root",
@@ -173,32 +221,25 @@ def main() -> None:
     ]
     if args.clean:
         export_cmd.append("--clean")
+    if not args.no_chunk_decoder:
+        export_cmd.extend(
+            [
+                "--with-chunk-decoder",
+                "--chunk-size",
+                str(args.chunk_size),
+                "--left-context-size",
+                str(args.left_context_size),
+            ]
+        )
+    if args.skip_speaker_encoder or (model_type in {"custom_voice", "voice_design"} and not args.include_speaker_encoder):
+        export_cmd.append("--skip-speaker-encoder")
     run_command(export_cmd, args.dry_run)
-
-    if args.with_chunk_decoder:
-        chunk_cmd = [
-            py,
-            str(tokenizer_export),
-            "--model",
-            args.model,
-            "--output-dir",
-            str(output_root / "tokenizer12hz"),
-            "--device",
-            device,
-            "--dtype",
-            dtype,
-            "--only-chunk-decoder",
-            "--chunk-size",
-            str(args.chunk_size),
-            "--left-context-size",
-            str(args.left_context_size),
-        ]
-        run_command(chunk_cmd, args.dry_run)
 
     if not args.skip_consolidate:
         consolidate_cmd = [
             py,
-            str(consolidate),
+            str(export_impl),
+            "consolidate",
             "--root",
             str(output_root),
         ]

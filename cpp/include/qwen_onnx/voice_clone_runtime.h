@@ -81,7 +81,7 @@ struct VoiceCloneResult {
 
 struct VoiceCloneChunkOptions {
   // 每生成多少 codec 帧就触发一次 tokenizer_decode_chunk。
-  int chunk_frames = 50;
+  int chunk_frames = 300;
   // chunk 解码时带多少左侧上下文帧，降低块边界不连续。
   int left_context_frames = 25;
   // true 时用后台线程解码 chunk，让生成线程继续往前跑。
@@ -203,6 +203,12 @@ class VoiceCloneRuntime {
   VoiceCloneChunkedResult GenerateVoiceCloneChunked(const VoiceCloneRequest& request,
                                                     const VoiceCloneChunkOptions& chunk_options,
                                                     const VoiceCloneChunkCallback& on_chunk = {});
+  VoiceCloneChunkedResult GenerateCustomVoiceChunked(const CustomVoiceRequest& request,
+                                                     const VoiceCloneChunkOptions& chunk_options,
+                                                     const VoiceCloneChunkCallback& on_chunk = {});
+  VoiceCloneChunkedResult GenerateVoiceDesignChunked(const VoiceDesignRequest& request,
+                                                     const VoiceCloneChunkOptions& chunk_options,
+                                                     const VoiceCloneChunkCallback& on_chunk = {});
 
  private:
   OrtSession& ChunkDecoder();
@@ -222,6 +228,16 @@ class VoiceCloneRuntime {
                                       const SamplingOptions& main_sampling,
                                       const SamplingOptions& code_sampling,
                                       const std::filesystem::path& debug_dump_dir);
+  VoiceCloneChunkedResult GenerateFromPromptChunked(const FloatTensor& prompt,
+                                                    const FloatTensor& trailing_text,
+                                                    const FloatTensor& tts_pad,
+                                                    const Int64Tensor& reference_codes,
+                                                    int max_new_tokens,
+                                                    const SamplingOptions& main_sampling,
+                                                    const SamplingOptions& code_sampling,
+                                                    const std::filesystem::path& debug_dump_dir,
+                                                    const VoiceCloneChunkOptions& chunk_options,
+                                                    const VoiceCloneChunkCallback& on_chunk);
   std::pair<std::vector<int64_t>, FloatTensor> RunCodePredictor(const FloatTensor& past_hidden,
                                                                  int64_t first_token,
                                                                  const SamplingOptions& options,

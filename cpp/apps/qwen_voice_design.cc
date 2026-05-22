@@ -32,7 +32,8 @@ void Usage(const char* argv0) {
             << " [--provider CPUExecutionProvider|CUDAExecutionProvider]"
             << " [--prep-provider CPUExecutionProvider|CUDAExecutionProvider]"
             << " [--decode-provider CPUExecutionProvider|CUDAExecutionProvider]"
-            << " [--language Chinese] [--max-new-tokens N] [--seed N] [--cuda-device N]"
+            << " [--language Chinese] [--max-new-tokens N] [--chunk-frames N]"
+            << " [--left-context-frames N] [--legacy-full-decoder] [--seed N] [--cuda-device N]"
             << " [--greedy] [--codes-output codes.npy] [--dump-dir DIR] [--no-timing]\n";
 }
 
@@ -86,9 +87,11 @@ int main(int argc, char** argv) {
   request.instruct = "一个年轻女性的声音，语气温柔自然，语速适中，发音清晰。";
   request.max_new_tokens = 120;
 
+  qwen::onnx::VoiceCloneChunkOptions chunk_options;
   std::filesystem::path output = "output_voice_design_cpp.wav";
   std::filesystem::path codes_output;
   bool greedy = false;
+  bool legacy_full_decoder = false;
   bool print_timing = true;
 
   for (int i = 1; i < argc; ++i) {
@@ -109,6 +112,9 @@ int main(int argc, char** argv) {
     else if (arg == "--codes-output") codes_output = next();
     else if (arg == "--dump-dir") request.debug_dump_dir = next();
     else if (arg == "--max-new-tokens") request.max_new_tokens = std::stoi(next());
+    else if (arg == "--chunk-frames") chunk_options.chunk_frames = std::stoi(next());
+    else if (arg == "--left-context-frames") chunk_options.left_context_frames = std::stoi(next());
+    else if (arg == "--legacy-full-decoder") legacy_full_decoder = true;
     else if (arg == "--seed") options.seed = static_cast<uint64_t>(std::stoull(next()));
     else if (arg == "--cuda-device") options.cuda_device_id = std::stoi(next());
     else if (arg == "--greedy") greedy = true;
@@ -130,6 +136,8 @@ int main(int argc, char** argv) {
       request.main_sampling.do_sample = false;
       request.code_sampling.do_sample = false;
     }
+    if (chunk_options.chunk_frames <= 0) throw std::runtime_error("--chunk-frames must be positive");
+    if (chunk_options.left_context_frames < 0) throw std::runtime_error("--left-context-frames must be non-negative");
 
     std::cerr << "Using run provider=" << (options.providers.empty() ? "<none>" : options.providers[0])
               << ", prep provider=" << (options.prep_providers.empty() ? "<none>" : options.prep_providers[0])
@@ -141,20 +149,39 @@ int main(int argc, char** argv) {
     const double init_ms = ElapsedMs(init_start);
 
     const auto gen_start = Clock::now();
-    auto result = runtime.GenerateVoiceDesign(request);
+    qwen::onnx::VoiceCloneResult full_result;
+    qwen::onnx::VoiceCloneChunkedResult chunked_result;
+    const qwen::onnx::FloatTensor* waveform = nullptr;
+    const qwen::onnx::Int64Tensor* generated_codes = nullptr;
+    int sample_rate = 24000;
+    size_t chunk_count = 0;
+    if (legacy_full_decoder) {
+      full_result = runtime.GenerateVoiceDesign(request);
+      waveform = &full_result.waveform;
+      generated_codes = &full_result.generated_codes;
+      sample_rate = full_result.sample_rate;
+    } else {
+      chunked_result = runtime.GenerateVoiceDesignChunked(request, chunk_options);
+      waveform = &chunked_result.waveform;
+      generated_codes = &chunked_result.generated_codes;
+      sample_rate = chunked_result.sample_rate;
+      chunk_count = chunked_result.chunks.size();
+    }
     const double generate_ms = ElapsedMs(gen_start);
 
     const auto write_start = Clock::now();
-    qwen::onnx::WriteWav(output, result.waveform.values(), result.sample_rate);
+    qwen::onnx::WriteWav(output, waveform->values(), sample_rate);
     if (!codes_output.empty()) {
-      WriteNpy(codes_output, result.generated_codes.values(), result.generated_codes.shape());
+      WriteNpy(codes_output, generated_codes->values(), generated_codes->shape());
     }
     const double write_ms = ElapsedMs(write_start);
 
     std::cout << "wrote " << output.string()
-              << ": samples=" << result.waveform.size()
-              << " sr=" << result.sample_rate
-              << " generated_frames=" << result.generated_codes.shape()[0] << "\n";
+              << ": samples=" << waveform->size()
+              << " sr=" << sample_rate
+              << " generated_frames=" << generated_codes->shape()[0]
+              << " chunks=" << chunk_count
+              << " legacy_full_decoder=" << (legacy_full_decoder ? 1 : 0) << "\n";
     if (!codes_output.empty()) {
       std::cout << "wrote " << codes_output.string() << "\n";
     }
@@ -164,7 +191,8 @@ int main(int argc, char** argv) {
       const auto old_precision = std::cout.precision();
       std::cout << "\n[Timing] Overall\n" << std::fixed << std::setprecision(2)
                 << "  total.init_runtime: " << init_ms << " ms\n"
-                << "  total.generate_voice_design: " << generate_ms << " ms\n"
+                << "  total.generate_voice_design" << (legacy_full_decoder ? "" : "_chunked")
+                << ": " << generate_ms << " ms\n"
                 << "  total.write_outputs: " << write_ms << " ms\n";
       std::cout.flags(old_flags);
       std::cout.precision(old_precision);
