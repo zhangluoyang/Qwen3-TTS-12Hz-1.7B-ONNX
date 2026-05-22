@@ -81,8 +81,14 @@ target_link_libraries(qwen_voice_clone_chunk PRIVATE qwen_onnx_runtime)
 add_executable(qwen_custom_voice apps/qwen_custom_voice.cc)
 target_link_libraries(qwen_custom_voice PRIVATE qwen_onnx_runtime)
 
+add_executable(qwen_custom_voice_chunk apps/qwen_custom_voice_chunk.cc)
+target_link_libraries(qwen_custom_voice_chunk PRIVATE qwen_onnx_runtime)
+
 add_executable(qwen_voice_design apps/qwen_voice_design.cc)
 target_link_libraries(qwen_voice_design PRIVATE qwen_onnx_runtime)
+
+add_executable(qwen_voice_design_chunk apps/qwen_voice_design_chunk.cc)
+target_link_libraries(qwen_voice_design_chunk PRIVATE qwen_onnx_runtime)
 
 add_executable(qwen_prefill_debug apps/qwen_prefill_debug.cc)
 target_link_libraries(qwen_prefill_debug PRIVATE qwen_onnx_runtime)
